@@ -1,0 +1,43 @@
+# Optional hardening: the auditd-config ServiceAccount can patch nodes, but this
+# admission policy only lets it (a) remove the startup taint, (b) on its own
+# node, and (c) change nothing else. Needs Kubernetes >= 1.30 (VAP GA).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: auditd-config-taint-guard
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes"]
+  matchConditions:
+    - name: is-auditd-config-sa
+      expression: request.userInfo.username == 'system:serviceaccount:node-config:auditd-config'
+  variables:
+    - name: taintKey
+      expression: "'startup-taint.cluster-autoscaler.kubernetes.io/auditd-not-ready'"
+  validations:
+    - expression: >-
+        object.spec.?taints.orValue([]) ==
+        oldObject.spec.?taints.orValue([]).filter(t, t.key != variables.taintKey)
+      message: auditd-config may only remove its own startup taint.
+    - expression: >-
+        object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) &&
+        object.spec.?unschedulable.orValue(false) == oldObject.spec.?unschedulable.orValue(false)
+      message: auditd-config may not change node labels or cordon state.
+    # Bound SA tokens carry the pod's node name (K8s >= 1.30). If present, enforce it.
+    - expression: >-
+        !('authentication.kubernetes.io/node-name' in request.userInfo.extra) ||
+        request.userInfo.extra['authentication.kubernetes.io/node-name'][0] == object.metadata.name
+      message: auditd-config may only modify the node it runs on.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: auditd-config-taint-guard
+spec:
+  policyName: auditd-config-taint-guard
+  validationActions: ["Deny"]

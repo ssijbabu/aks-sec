@@ -1,0 +1,28 @@
+# Cluster-bootstrap ordering with Flux (AKS GitOps extension).
+# "node-config" must be applied and healthy (DaemonSet Ready on all nodes)
+# before Flux applies anything in "apps".
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: node-config
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./clusters/prod/node-config      # 00-, 10-, 20-, 25- manifests
+  prune: true
+  sourceRef: { kind: GitRepository, name: platform }
+  wait: true                             # health-check everything it applies
+  timeout: 15m
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: node-config
+  interval: 10m
+  path: ./clusters/prod/apps
+  prune: true
+  sourceRef: { kind: GitRepository, name: platform }

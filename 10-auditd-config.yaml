@@ -1,0 +1,250 @@
+# Applies org auditd rules + auditd.conf tuning to every Azure Linux node,
+# including nodes created by scale-out, upgrade, or reimage.
+#
+# Edit the ConfigMap to change rules. The pod re-checks every RECONCILE_SECONDS
+# and picks up ConfigMap changes (kubelet syncs mounted ConfigMaps in ~1 min),
+# so no rollout is needed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auditd-rules
+  namespace: node-config
+data:
+  # Every *.rules key is written to /etc/audit/rules.d/90-org-<key> on the node.
+  base.rules: |
+    ## Buffer and rate limit. Keep these sane on busy nodes.
+    -b 8192
+    -r 1000
+    --backlog_wait_time 60000
+    -f 1
+
+  identity.rules: |
+    -w /etc/passwd  -p wa -k identity
+    -w /etc/shadow  -p wa -k identity
+    -w /etc/group   -p wa -k identity
+    -w /etc/gshadow -p wa -k identity
+    -w /etc/sudoers    -p wa -k priv_esc
+    -w /etc/sudoers.d/ -p wa -k priv_esc
+
+  node.rules: |
+    ## Kubelet / container runtime config tampering
+    -w /etc/kubernetes/ -p wa -k k8s_config
+    -w /var/lib/kubelet/config.yaml -p wa -k k8s_config
+    -w /etc/containerd/ -p wa -k containerd_config
+    ## SSH config
+    -w /etc/ssh/sshd_config -p wa -k sshd
+    ## Kernel module load/unload
+    -a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k kmod
+    ## Commands run as root by a real logged-in user (auid set), i.e. humans on the node,
+    ## not every exec from containers (that would be very noisy).
+    -a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -F auid!=unset -k root_cmd
+
+  # Applied to /etc/audit/auditd.conf as key = value.
+  auditd.conf.overrides: |
+    max_log_file = 50
+    num_logs = 5
+    max_log_file_action = ROTATE
+    space_left_action = SYSLOG
+    admin_space_left_action = SYSLOG
+    disk_full_action = ROTATE
+    disk_error_action = SYSLOG
+---
+# Lets the DaemonSet remove the startup taint from its own node.
+# (RBAC can't restrict "own node" or "only this taint"; see
+#  25-taint-guard-policy.yaml for an admission policy that does.)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auditd-config
+  namespace: node-config
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: auditd-config-taint-remover
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: auditd-config-taint-remover
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: auditd-config-taint-remover
+subjects:
+  - kind: ServiceAccount
+    name: auditd-config
+    namespace: node-config
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: auditd-config
+  namespace: node-config
+  labels: { app: auditd-config }
+spec:
+  selector:
+    matchLabels: { app: auditd-config }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 20% }
+  template:
+    metadata:
+      labels: { app: auditd-config }
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      hostPID: true
+      hostNetwork: true            # audit netlink is only usable from the host netns
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      serviceAccountName: auditd-config
+      tolerations:
+        - operator: Exists         # every node pool, incl. the startup taint below
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: apply
+          # Built from Dockerfile in this folder (azurelinux core + curl + jq).
+          image: <your-acr>.azurecr.io/node-config/auditd-config:1.0
+          securityContext:
+            privileged: true
+          env:
+            - { name: RECONCILE_SECONDS, value: "300" }
+            # Node pools are created with this taint; it's removed once auditd is configured.
+            - { name: STARTUP_TAINT_KEY, value: "startup-taint.cluster-autoscaler.kubernetes.io/auditd-not-ready" }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          command: ["/bin/bash", "/scripts/apply.sh"]
+          startupProbe:
+            exec: { command: ["test", "-f", "/tmp/ready"] }
+            periodSeconds: 5
+            failureThreshold: 120    # up to 10 min (covers tdnf install on a fresh node)
+          readinessProbe:
+            exec: { command: ["test", "-f", "/tmp/ready"] }
+            periodSeconds: 30
+          volumeMounts:
+            - { name: host,    mountPath: /host }
+            - { name: rules,   mountPath: /config, readOnly: true }
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+          resources:
+            requests: { cpu: 5m,  memory: 16Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+      volumes:
+        - name: host
+          hostPath: { path: /, type: Directory }
+        - name: rules
+          configMap: { name: auditd-rules }
+        - name: scripts
+          configMap: { name: auditd-config-script }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auditd-config-script
+  namespace: node-config
+data:
+  apply.sh: |
+    #!/bin/bash
+    set -uo pipefail
+    H=/host
+    STATE_DIR=$H/var/lib/org-auditd
+    log() { echo "$(date -u +%FT%TZ) [$NODE_NAME] $*"; }
+    hostrun() { chroot "$H" "$@"; }
+
+    ensure_auditd() {
+      if ! hostrun sh -c 'command -v auditctl' >/dev/null 2>&1; then
+        log "audit package missing, installing via tdnf (needs egress to packages.microsoft.com)"
+        hostrun tdnf install -y audit || { log "ERROR: could not install audit"; return 1; }
+      fi
+      if ! hostrun systemctl is-active --quiet auditd; then
+        log "starting auditd"
+        hostrun systemctl enable --now auditd || { log "ERROR: auditd failed to start"; return 1; }
+      fi
+      local enabled
+      enabled=$(hostrun auditctl -s | awk '/^enabled/{print $2}')
+      case "$enabled" in
+        2) log "ERROR: audit rules are immutable (-e 2) on this node; changes need a reboot"; return 1 ;;
+        0) log "audit disabled in kernel, enabling"; hostrun auditctl -e 1 ;;
+      esac
+    }
+
+    desired_hash() {
+      cat /config/*.rules /config/auditd.conf.overrides 2>/dev/null | sha256sum | cut -d' ' -f1
+    }
+
+    apply() {
+      mkdir -p "$STATE_DIR"
+
+      # 1. rules: write ours, drop stale org files no longer in the ConfigMap
+      for f in "$H"/etc/audit/rules.d/90-org-*.rules; do
+        [ -e "$f" ] || continue
+        [ -e "/config/${f##*/90-org-}" ] || { log "removing stale ${f##*/}"; rm -f "$f"; }
+      done
+      for src in /config/*.rules; do
+        install -m 0640 "$src" "$H/etc/audit/rules.d/90-org-$(basename "$src")"
+      done
+
+      # 2. auditd.conf overrides
+      local conf=$H/etc/audit/auditd.conf
+      [ -f "$STATE_DIR/auditd.conf.orig" ] || cp "$conf" "$STATE_DIR/auditd.conf.orig"
+      while IFS='=' read -r k v; do
+        k=$(echo "$k" | xargs); v=$(echo "$v" | xargs)
+        [ -z "$k" ] && continue
+        if grep -qE "^\s*$k\s*=" "$conf"; then
+          sed -i -E "s|^\s*$k\s*=.*|$k = $v|" "$conf"
+        else
+          echo "$k = $v" >> "$conf"
+        fi
+      done < /config/auditd.conf.overrides
+
+      # 3. load: augenrules merges rules.d; SIGHUP makes auditd re-read auditd.conf
+      hostrun augenrules --load || { log "ERROR: augenrules --load failed"; return 1; }
+      hostrun systemctl kill --signal=HUP auditd || true
+
+      desired_hash > "$STATE_DIR/applied.sha"
+      log "applied: $(hostrun auditctl -l | wc -l) rules loaded"
+    }
+
+    # Remove the node's startup taint so regular workloads can schedule here.
+    # Strategic-merge "$patch: delete" removes only our taint (taints merge on "key").
+    remove_startup_taint() {
+      [ -f /tmp/untainted ] && return 0
+      local sa=/var/run/secrets/kubernetes.io/serviceaccount
+      local api="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+      local patch
+      patch=$(jq -cn --arg k "$STARTUP_TAINT_KEY" '{spec:{taints:[{key:$k,"$patch":"delete"}]}}')
+      if curl -sS --fail -o /dev/null -X PATCH \
+           --cacert "$sa/ca.crt" -H "Authorization: Bearer $(cat "$sa/token")" \
+           -H 'Content-Type: application/strategic-merge-patch+json' \
+           --data "$patch" "$api/api/v1/nodes/$NODE_NAME"; then
+        touch /tmp/untainted
+        log "startup taint removed; node open for workloads"
+      else
+        log "ERROR: failed to remove startup taint (will retry)"
+        return 1
+      fi
+    }
+
+    # Fast retries until the node is ready for the first time, then slow reconcile.
+    while true; do
+      if ensure_auditd; then
+        want=$(desired_hash)
+        have=$(cat "$STATE_DIR/applied.sha" 2>/dev/null || true)
+        loaded=$(hostrun auditctl -l 2>/dev/null | grep -c -- '-k ' || true)
+        # Re-apply on config change, or if our keyed rules got flushed (drift).
+        if [ "$want" != "$have" ] || [ "$loaded" -eq 0 ]; then
+          apply
+        fi
+        # Only signal ready / open the node once rules are actually loaded.
+        if [ "$(cat "$STATE_DIR/applied.sha" 2>/dev/null)" = "$want" ] \
+           && [ "$(hostrun auditctl -l 2>/dev/null | grep -c -- '-k ')" -gt 0 ]; then
+          touch /tmp/ready
+          remove_startup_taint || { sleep 5; continue; }
+        fi
+      fi
+      if [ -f /tmp/untainted ]; then sleep "${RECONCILE_SECONDS:-300}"; else sleep 5; fi
+    done

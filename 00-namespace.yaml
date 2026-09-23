@@ -1,0 +1,11 @@
+# Dedicated namespace for node-level agents. It must be allowed to run
+# privileged / hostPID / hostPath pods, so keep RBAC on it tight and add an
+# Azure Policy (Gatekeeper) exemption for it if you use AKS policy add-on.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: node-config
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
+    pod-security.kubernetes.io/audit: privileged

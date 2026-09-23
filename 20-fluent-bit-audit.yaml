@@ -1,0 +1,130 @@
+# Ships /var/log/audit/audit.log from every node to a Log Analytics custom
+# table (AKSNodeAudit_CL) via the Logs Ingestion API (DCE + DCR).
+# Create the table/DCE/DCR first with la-setup.sh, then fill in the Secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fluent-bit-la
+  namespace: node-config
+type: Opaque
+stringData:
+  TENANT_ID: "<tenant-id>"
+  CLIENT_ID: "<app-client-id>"
+  CLIENT_SECRET: "<app-client-secret>"
+  DCE_URL: "https://<dce-name>.<region>-1.ingest.monitor.azure.com"
+  DCR_ID: "dcr-<immutable-id>"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-audit
+  namespace: node-config
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         5
+        Log_Level     info
+        Parsers_File  parsers.conf
+        HTTP_Server   On
+        HTTP_Listen   0.0.0.0
+        HTTP_Port     2020
+        storage.path  /var/lib/fluent-bit-audit/buffer
+        storage.sync  normal
+
+    [INPUT]
+        Name              tail
+        Tag               audit
+        Path              /var/log/audit/audit.log
+        Parser            auditd
+        DB                /var/lib/fluent-bit-audit/tail.db
+        Rotate_Wait       30
+        Refresh_Interval  5
+        Mem_Buf_Limit     20MB
+        storage.type      filesystem
+        Skip_Long_Lines   On
+
+    [FILTER]
+        Name    modify
+        Match   audit
+        Add     Computer ${NODE_NAME}
+        Add     Cluster  ${CLUSTER_NAME}
+        Rename  type     AuditType
+        Rename  serial   AuditSerial
+        Rename  msg      RawData
+
+    [OUTPUT]
+        Name            azure_logs_ingestion
+        Match           audit
+        tenant_id       ${TENANT_ID}
+        client_id       ${CLIENT_ID}
+        client_secret   ${CLIENT_SECRET}
+        dce_url         ${DCE_URL}
+        dcr_id          ${DCR_ID}
+        table_name      AKSNodeAudit_CL
+        time_generated  true
+        time_key        TimeGenerated
+        compress        true
+        Retry_Limit     False
+
+  parsers.conf: |
+    # type=SYSCALL msg=audit(1727090000.123:4567): arch=c000003e syscall=59 ...
+    [PARSER]
+        Name        auditd
+        Format      regex
+        Regex       ^type=(?<type>\S+) msg=audit\((?<time>\d+\.\d+):(?<serial>\d+)\): ?(?<msg>.*)$
+        Time_Key    time
+        Time_Format %s.%L
+        Time_Keep   Off
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit-audit
+  namespace: node-config
+  labels: { app: fluent-bit-audit }
+spec:
+  selector:
+    matchLabels: { app: fluent-bit-audit }
+  template:
+    metadata:
+      labels: { app: fluent-bit-audit }
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      priorityClassName: system-node-critical
+      automountServiceAccountToken: false
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: fluent-bit
+          # Pin to a version you've tested; azure_logs_ingestion needs >= 2.2.
+          image: cr.fluentbit.io/fluent/fluent-bit:4.0
+          securityContext:
+            runAsUser: 0             # audit.log is 0600 root
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"], add: ["DAC_READ_SEARCH"] }
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - { name: CLUSTER_NAME, value: "<cluster-name>" }
+          envFrom:
+            - secretRef: { name: fluent-bit-la }
+          ports:
+            - { name: metrics, containerPort: 2020 }
+          livenessProbe:
+            httpGet: { path: /, port: 2020 }
+          resources:
+            requests: { cpu: 20m,  memory: 50Mi }
+            limits:   { cpu: 200m, memory: 200Mi }
+          volumeMounts:
+            - { name: config,    mountPath: /fluent-bit/etc/ }
+            - { name: auditlog,  mountPath: /var/log/audit, readOnly: true }
+            - { name: state,     mountPath: /var/lib/fluent-bit-audit }
+      volumes:
+        - name: config
+          configMap: { name: fluent-bit-audit }
+        - name: auditlog
+          hostPath: { path: /var/log/audit, type: DirectoryOrCreate }
+        - name: state
+          hostPath: { path: /var/lib/fluent-bit-audit, type: DirectoryOrCreate }
